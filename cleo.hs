@@ -1,11 +1,12 @@
 module Main where
 import IO hiding(try)
 import Monad
-import Data.Char (isSymbol, isPunctuation)
-import Data.List (concat)
+import Data.Char (isSymbol, isPunctuation, isSpace)
+import Data.List (concat isPrefixOf findIndex)
 import System.Console.GetOpt
+import Test.QuickCheck
 
-import Text.ParserCombinators.Parsec
+import Text.ParserCombinators.Parsec hiding (Parser)
 import System.Environment.UTF8
 import System.Console.Readline
 import Data.Decimal
@@ -30,33 +31,95 @@ data Element = Symbol String
   | Comment String
   deriving Show
 
+type Parser a = GenParser Char ParserState a
+
+data ParsedLine = 
+  ParsedLine {
+    parsedIndent :: String,
+    parsedLine :: [Element],
+    parsedElements :: [Element]
+  }
+  deriving Show
+
 main :: IO ()
 main = do
   args <- getArgs
   putStrLn (readExpr (args !! 0))
 
 readExpr :: String -> String
-readExpr input = case parse parseExpr "Prototype Language" input of
+readExpr input = case runParser parseModule () "stdin" input of
   Left err -> "No match: " ++ show err
   Right val -> "Found value: " ++ show val
+
+parseModule :: Parser Element
+parseModule = do 
+    list <- parseElements "" []
+    spaces
+    eof
+    return $ list
+
+parseElements :: String -> [Element] Parser Element
+parseElements parentIndex elements = do
+  indent <- spacesLine
+  line <- parseListElementsLine
+  eol
+  parsed <- parseElementsRec parentIndent elements indent line
+  return $ List $ parsedElements parsed
+
+parseElementsRec :: String -> [Element] -> String -> [Element] -> Parser (ParsedLine)
+parseElementsRec parentIndent elements indent line = do
+  case line of
+    (_:[]) ->
+      if parentIndent == indent then do
+        parsed <- parseElementsRec indent line
+        return ParsedLine{
+          parsedLine=line, 
+          parsedIndent=indent, 
+          parsedElements=parsedElements parsed}
+      else if parentIndent `isPrefixOf` indent then do
+        parsed <- parseElementsRec indent elements
+        case childElements of
+          (_:_:[]) -> List childElements
+          (e:[]) -> e
+          otherwise -> fail "Bad parse"
+      else if length indent < length parentIndent && 
+          not indent `isPrefixOf` parentIndent then
+        fail "Bad parse"
+      else 
+        return ParsedLine{indent=indent, line=line, elements=elements}
+    -- if line is empty, ignore indentation and skip to next iteration
+    otherwise -> parseElements parentIndent parentElements
+
+eol :: Parser ()
+eol = char '\n' <|> (try $ string "\r\n")
 
 spaces1 :: Parser ()
 spaces1 = skipMany1 space
 
+parseQuotedString :: Parser String
+parseQuotedString = do
+    char '\''
+    string <- many $ noneOf "'" <|> try (string "''" >> return '\'')
+    char '\''
+    return string
+
 parseQuoted :: Parser Element
 parseQuoted = do
-    char '\''
-    x <- many $ noneOf "'" <|> try (string "''" >> return '\'')
-    char '\''
-    return $ String x
+      string <- parseQuotedString
+      return $ String string
   <?> "Single Quoted String"
+
+parseDoubleQuotedString :: Parser String
+parseDoubleQuotedString = do
+    char '"'
+    string <- many $ noneOf "\"" <|> try (string "\"\"" >> return '"')
+    char '"'
+    return string
 
 parseDoubleQuoted :: Parser Element
 parseDoubleQuoted = do
-    char '"'
-    x <- many $ noneOf "\"" <|> try (string "\"\"" >> return '"')
-    char '"'
-    return $ DoubleString x
+      string <- parseDoubleQuotedString
+      return $ String string
   <?> "Double Quoted String"
 
 parseSymbol :: Parser Element
@@ -91,15 +154,33 @@ parseBacktickQuoted = do
 parseComment :: Parser Element
 parseComment = do
     string "#"
-    spaces
-    comment <- manyTill anyChar (try (
-          do string "\r\n" 
-             return ()
-      <|> do string "\n"
-             return ()
-      <|> eof))
+    comment <- parseBalancedParens ('(',')')
+      <|> parseBalancedParens ('{','}')
+      <|> parseBalancedParens ('[',']')
+      <|> parseQuotedString
+      <|> parseDoubleQuotedString
+      <|> do 
+          spaces
+          manyTill anyChar (try (
+                do string "\r\n" 
+                   return ()
+            <|> do string "\n"
+                   return ()
+            <|> eof))
     return $ Comment comment
   <?> "Comment"
+
+parseBalancedParens :: (Char,Char) -> Parser String
+parseBalancedParens pair = do
+    char (fst pair)
+    comment <- (many ((many1 (noneOf [(fst pair),(snd pair)])) 
+               <|> do
+                   c <- parseBalancedParens pair
+                   return $ [fst pair] ++ c ++ [snd pair]))
+    let combined = concat comment
+    char (snd pair)
+    return combined
+  <?> "Parenthesized Comment"
 
 parseList :: Parser Element
 parseList = do
@@ -127,6 +208,21 @@ parseCurlyBraceList = do
     char '}'
     return $ CurlyBraceList x
   <?> "Curly Brace List"
+
+spaceLine :: CharParser st Char
+spaceLine = satisfy (\c -> c /= '\n' && c /= '\r' && isSpace(c))
+
+spacesLine :: Parser String
+spacesLine = many spaceLine
+
+spacesLine1 :: Parser String
+spacesLine1 = many1 spaceLine
+
+parseListElementsLine :: Parser [Element]
+parseListElementsLine = do
+  clusters <- sepEndBy parseElementCluster spacesLine1
+  let catted = concat clusters
+  return catted
 
 parseListElements :: Parser [Element]
 parseListElements = do
@@ -161,9 +257,6 @@ parseInfixPostfix = do
   return $ case item of
     (_:[]) -> Operator op : item
     otherwise -> [PostfixOperator op]
-
-parseExpr :: Parser Element
-parseExpr = parseItem
 
 parseItem :: Parser Element
 parseItem = parseQuoted 
