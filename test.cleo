@@ -1,28 +1,36 @@
-define
-  fac x
-  if
-  = x 0
-  1
-  * x
-    fac
-      - x 1
+This is a comment
 
-let
-  group
-  foo
-    + 1 2
-  bar
-    + 3 4
-  + foo bar
+  define
+    fac x
+    if
+    = x 0
+    1
+    * x
+      fac
+        - x 1
 
-define (fac x)
-  if (= x 0) 1
-  * x
-    fac (- x 1)
+This is a comment 2
 
-let
-  group
-  foo (+ 1 2)
-  bar (+ 3 4)
-  + foo bar
+  let
+    group
+    foo
+      + 1 2
+    bar
+      + 3 4
+    + foo bar
+
+This is a comment 3
+
+  define (fac x)
+    if (= x 0) 1
+    * x
+      fac (- x 1)
+
+This is a comment 4
+
+  let
+    group
+    foo (+ 1 2)
+    bar (+ 3 4)
+    + foo bar
 
