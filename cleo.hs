@@ -2,16 +2,20 @@ module Main where
 import IO hiding(try)
 import Monad
 import Data.Char (isSymbol, isPunctuation, isSpace)
-import Data.List (concat isPrefixOf findIndex)
+import Data.List (concat, isPrefixOf, findIndex)
 import System.Console.GetOpt
-import Test.QuickCheck
 
-import Text.ParserCombinators.Parsec hiding (Parser)
+--import Test.QuickCheck
+import Text.ParserCombinators.Parsec
 import System.Environment.UTF8
-import System.Console.Readline
-import Data.Decimal
-import LLVM.Core
-import LLVM.ExecutionEngine
+--import System.Console.Readline
+--import Data.Decimal
+--import LLVM.Core
+--import LLVM.ExecutionEngine
+
+data Token = Token String
+  | Indent
+  | Dedent
 
 data Element = Symbol String
   | Operator String
@@ -31,8 +35,6 @@ data Element = Symbol String
   | Comment String
   deriving Show
 
-type Parser a = GenParser Char ParserState a
-
 data ParsedLine = 
   ParsedLine {
     parsedIndent :: String,
@@ -44,54 +46,124 @@ data ParsedLine =
 main :: IO ()
 main = do
   args <- getArgs
-  putStrLn (readExpr (args !! 0))
+  let file = args !! 0
+  parseFile file
+
+parseFile :: String -> IO ()
+parseFile file = do
+  --putStrLn (readExpr (args !! 0))
+  str <- readFile file
+  putStrLn (readExpr str)
 
 readExpr :: String -> String
-readExpr input = case runParser parseModule () "stdin" input of
+readExpr input = case runParser parseModule () "stdin" (input ++ "\n") of
   Left err -> "No match: " ++ show err
   Right val -> "Found value: " ++ show val
 
 parseModule :: Parser Element
-parseModule = do 
-    list <- parseElements "" []
-    spaces
-    eof
-    return $ list
+parseModule = 
+    do eof 
+       return $ List []
+    <|> do
+        line <- parseLine []
+        parsed <- parseElements "" (parsedIndent line) (parsedLine line)
+        eof
+        return $ List $ parsedElements parsed
+    <?> "parseModule"
 
-parseElements :: String -> [Element] Parser Element
-parseElements parentIndex elements = do
-  indent <- spacesLine
-  line <- parseListElementsLine
-  eol
-  parsed <- parseElementsRec parentIndent elements indent line
-  return $ List $ parsedElements parsed
 
-parseElementsRec :: String -> [Element] -> String -> [Element] -> Parser (ParsedLine)
-parseElementsRec parentIndent elements indent line = do
-  case line of
-    (_:[]) ->
-      if parentIndent == indent then do
-        parsed <- parseElementsRec indent line
-        return ParsedLine{
-          parsedLine=line, 
-          parsedIndent=indent, 
-          parsedElements=parsedElements parsed}
-      else if parentIndent `isPrefixOf` indent then do
-        parsed <- parseElementsRec indent elements
-        case childElements of
-          (_:_:[]) -> List childElements
-          (e:[]) -> e
-          otherwise -> fail "Bad parse"
-      else if length indent < length parentIndent && 
-          not indent `isPrefixOf` parentIndent then
-        fail "Bad parse"
-      else 
-        return ParsedLine{indent=indent, line=line, elements=elements}
-    -- if line is empty, ignore indentation and skip to next iteration
-    otherwise -> parseElements parentIndent parentElements
+parseLine :: [Element] -> Parser ParsedLine
+parseLine elements = do 
+      -- end of file
+      eof
+      return $ ParsedLine {
+        parsedIndent="",
+        parsedLine=elements,
+        parsedElements=[]
+      }
+  <|> do
+      -- literate comment
+      comment <- parseLiterateComment
+      parseLine (elements ++ [comment])
+  <|> do 
+      -- indented line
+      indent <- spacesLine1
+      line <- parseListElementsLine
+      eol
+      return $ ParsedLine {
+        parsedIndent=indent,
+        parsedLine=elements ++ line,
+        parsedElements=[]
+      }
+      <?> "parseLine"
 
-eol :: Parser ()
-eol = char '\n' <|> (try $ string "\r\n")
+-- Unindented lines are literate comments
+parseLiterateComment :: Parser Element
+parseLiterateComment = do
+    lines <- many1 parseLiterateCommentLine
+    let cat = concat lines
+    return $ Comment cat
+  <?> "Literate comment"
+
+parseLiterateCommentLine :: Parser String
+parseLiterateCommentLine = do
+      -- make sure this line is unindented
+      notFollowedBy spacesLine1
+      line <- manyTill anyChar (try (
+              do eol
+                 return ()))
+      return $ line ++ "\n"
+      <?> "Literate comment line"
+
+parseElements :: String -> String -> [Element] -> Parser ParsedLine
+parseElements parentIndent indent parentElements = do
+    -- parse multiple elements and aggregate parsed results
+    parsed <- parseElement parentIndent
+    case parsedElements parsed of 
+      e@(_:[]) -> do
+        parseElements parentIndent (parsedIndent parsed) (parentElements ++ e)
+      otherwise -> do
+        return ParsedLine {
+          parsedIndent=parsedIndent parsed, 
+          parsedLine=parsedLine parsed,
+          parsedElements=parentElements
+        }
+  <?> "parseElements"
+
+parseElement :: String -> Parser ParsedLine
+parseElement parentIndent =
+      do eof
+         return ParsedLine {parsedIndent="", parsedLine=[], parsedElements=[]}
+  <|> do
+      thisLine <- parseLine []
+      let indent = parsedIndent thisLine
+      let line = parsedLine thisLine
+      case line of
+        (_:[]) ->
+          if length indent <= length parentIndent then
+            if indent `isPrefixOf` parentIndent then do
+              -- end the tree and return
+              return ParsedLine {parsedIndent=indent, parsedLine=line, parsedElements=[]}
+            else do
+              fail "Inconsistent whitespace usage"
+          -- add new elements/trees to the parent
+          else if parentIndent `isPrefixOf` indent then do
+            -- get all child nodes
+            parseElements parentIndent indent line
+          else do
+            fail "Inconsistent whitespace usage"
+        -- if line is empty, ignore indentation and skip to next iteration
+        otherwise -> do
+          parseElement parentIndent
+  <?> "parseElement"
+      
+eol :: Parser String
+eol = string "\n" 
+    <|> do
+      a <- string "\r"
+      b <- option "" (string "\n")
+      return $ a ++ b
+  <?> "eol"
 
 spaces1 :: Parser ()
 spaces1 = skipMany1 space
@@ -99,7 +171,7 @@ spaces1 = skipMany1 space
 parseQuotedString :: Parser String
 parseQuotedString = do
     char '\''
-    string <- many $ noneOf "'" <|> try (string "''" >> return '\'')
+    string <- many $ noneOf "'\n" <|> try (string "''" >> return '\'')
     char '\''
     return string
 
@@ -112,7 +184,7 @@ parseQuoted = do
 parseDoubleQuotedString :: Parser String
 parseDoubleQuotedString = do
     char '"'
-    string <- many $ noneOf "\"" <|> try (string "\"\"" >> return '"')
+    string <- many $ noneOf "\"\n" <|> try (string "\"\"" >> return '"')
     char '"'
     return string
 
@@ -138,7 +210,7 @@ parseOperatorString = do
           c /= '{' && c /= '}' && 
           c /= '[' && c /= ']' && 
           c /= '\'' && c /= '"' && c /= '`' &&
-          c /= '#' && c /= '_' &&
+          c /= ';' && c /= '_' &&
           (isSymbol c || isPunctuation c))) <?> "Operator")
     return operator
   <?> "Operator"
@@ -146,41 +218,23 @@ parseOperatorString = do
 parseBacktickQuoted :: Parser String
 parseBacktickQuoted = do
     char '`'
-    x <- many $ noneOf "`" <|> try (string "``" >> return '`')
+    x <- many $ noneOf "`\n" <|> try (string "``" >> return '`')
     char '`'
     return x
   <?> "Backquoted Operator"
 
 parseComment :: Parser Element
 parseComment = do
-    string "#"
-    comment <- parseBalancedParens ('(',')')
-      <|> parseBalancedParens ('{','}')
-      <|> parseBalancedParens ('[',']')
-      <|> parseQuotedString
-      <|> parseDoubleQuotedString
-      <|> do 
-          spaces
-          manyTill anyChar (try (
-                do string "\r\n" 
-                   return ()
-            <|> do string "\n"
-                   return ()
-            <|> eof))
+    string ";"
+    comment <- do 
+      spaces
+      manyTill anyChar (try (
+            do string "\r\n" 
+               return ()
+        <|> do string "\n"
+               return ()))
     return $ Comment comment
   <?> "Comment"
-
-parseBalancedParens :: (Char,Char) -> Parser String
-parseBalancedParens pair = do
-    char (fst pair)
-    comment <- (many ((many1 (noneOf [(fst pair),(snd pair)])) 
-               <|> do
-                   c <- parseBalancedParens pair
-                   return $ [fst pair] ++ c ++ [snd pair]))
-    let combined = concat comment
-    char (snd pair)
-    return combined
-  <?> "Parenthesized Comment"
 
 parseList :: Parser Element
 parseList = do
