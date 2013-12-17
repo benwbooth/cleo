@@ -6,7 +6,7 @@ import Data.List (concat, isPrefixOf, findIndex)
 import System.Console.GetOpt
 
 --import Test.QuickCheck
-import Text.ParserCombinators.Parsec
+import Text.ParserCombinators.Parsec hiding (Parser)
 import System.Environment.UTF8
 --import System.Console.Readline
 --import Data.Decimal
@@ -37,8 +37,9 @@ data Delim = Parens
   | Indent
   deriving Show
 
--- tokens + delimiters
-data Token = Token Item
+-- tokens + indented delimiters
+type Token = (SourcePos, Tok)
+data Tok = Token Item
   | Begin Delim
   | End Delim
   deriving Show
@@ -70,11 +71,11 @@ parseFile filename = do
 readExpr :: String -> String -> String
 readExpr input inputName =
   let tokens = case runParser parseTokens () inputName (input ++ "\n") of
-      Left err -> fail $ "No match: " ++ show err
-      Right val -> val
-  in case runParser parseModule () inputName tokens of
-      Left err -> "No match: " ++ show err
-      Right val -> "Found value: " ++ show val
+                  Left err -> fail $ "No match: " ++ show err
+                  Right val -> val
+    in case runParser parseModule () inputName tokens of
+        Left err -> "No match: " ++ show err
+        Right val -> "Found value: " ++ show val
 
 -- * Indented list parsing
 
@@ -83,22 +84,22 @@ parseTokens = parseLines [] [""]
 
 parseLines :: [Token] -> [String] -> Parser [Token]
 parseLines tokens indentStack = do
-  many (parseLiterateComment tokens indentStack
-    <|> parseTokenLines tokens indentStack)
+  option [] (parseLiterateComment tokens indentStack
+            <|> parseTokenLines tokens indentStack)
   return tokens
 
 -- Unindented lines are literate comments
 parseLiterateComment :: [Token] -> [String] -> Parser [Token]
 parseLiterateComment tokens indentStack = do
     lines <- many1 parseLiterateCommentLine
-    return $ parseLines (tokens ++ [Comment (concat lines)]) indentStack
+    parseLines (tokens ++ [Token $ Comment (concat lines)]) indentStack
   <?> "Literate comment"
 
 parseLiterateCommentLine :: Parser String
 parseLiterateCommentLine = do
       -- make sure this line is unindented
       notFollowedBy spaceLine
-      line <- many1 (notFollowedBy eol)
+      line <- many1 (notFollowedBy eol >> anyChar)
       eol_ <- eol
       return $ line ++ eol_
     <?> "Literate comment line"
@@ -146,41 +147,50 @@ spacesLine = many spaceLine
 spacesLine1 :: Parser String
 spacesLine1 = many1 spaceLine
 
-parseSymbol :: Parser Token
+parseSymbol :: Parser [Token]
 parseSymbol = do
     first <- letter <|> char '_'
     rest <- many (letter <|> digit <|> char '_')
-    suffix <- many (oneOf "?!")
-    let symbol = first : (rest ++ suffix)
-    return $ Token $ Symbol symbol
+    let symbol = first : rest
+    return [Token $ Symbol symbol]
   <?> "Symbol"
 
--- TODO: Add support for multiline indented string literals
-parseQuotedString :: Parser String
-parseQuotedString = do
-    char '\''
-    string <- many $ notFollowedBy (char '\'' <|> eol) <|> try (string "''" >> return '\'')
-    char '\''
-    return string
+parseIndentedString :: Parser [Token]
+parseIndentedString = do
+  preComments <- many parseNestedLiterateComment
+  indent <- spacesLine1
+  str <- many (notFollowedBy eol >> anyChar)
+  eol_ <- eol
+  rest <- many (parseIndentedStringLine indent)
+  return $ (concat preComments) ++ [Token $ String (str++eol_)] ++ (concat rest)
 
-parseQuoted :: Parser Token
+parseIndentedStringLine :: String -> Parser [Token]
+parseIndentedStringLine indent = try $ do
+  string indent
+  str <- many (notFollowedBy eol >> anyChar)
+  eol_ <- eol
+  postComments <- many parseNestedLiterateComment
+  return $ (Token (String (str++eol_))) : (concat postComments)
+
+parseQuoted :: Parser [Token]
 parseQuoted = do
-      string <- parseQuotedString
-      return $ Token $ String string
-  <?> "Single Quoted String"
-
-parseDoubleQuotedString :: Parser String
-parseDoubleQuotedString = do
-    char '"'
-    string <- many $ notFollowedBy (char '"' <|> eol) <|> try (string "\"\"" >> return '"')
-    char '"'
+    char '\''
+    string <- (((try (string "''" >> eol)) >> parseIndentedString)
+      <|> do
+          string <- many $ (notFollowedBy (string "'" <|> eol) >> anyChar) <|> try (string "''" >> return '\'')
+          char '\''
+          return [Token $ String string])
     return string
 
-parseDoubleQuoted :: Parser Token
+parseDoubleQuoted :: Parser [Token]
 parseDoubleQuoted = do
-      string <- parseDoubleQuotedString
-      return $ Token $ String string
-  <?> "Double Quoted String"
+    char '"'
+    string <- (((try (string "''" >> eol)) >> parseIndentedString)
+      <|> do
+          string <- many $ (notFollowedBy (string "\"" <|> eol) >> anyChar) <|> try (string "\"\"" >> return '"')
+          char '"'
+          return [Token $ String string])
+    return string
 
 parseBacktickQuoted :: Parser String
 parseBacktickQuoted = do
@@ -206,26 +216,29 @@ parseOperatorString = do
 parseCommentString :: Parser String
 parseCommentString = do
     try $ string "\\\\"
-    comment <- many (notFollowedBy eol)
+    comment <- many ((notFollowedBy eol) >> anyChar)
     eol_ <- eol
     return $ comment ++ eol_
   <?> "Comment"
 
-parseComment :: Parser Token
+parseComment :: Parser [Token]
 parseComment = do
   comment <- parseCommentString
-  return $ Comment comment
+  return $ [Token $ Comment comment]
 
-parsePostComment :: Parser Token
+parsePostComment :: Parser [Token]
 parsePostComment = do
   comment <- parseCommentString
-  return $ PostComment comment
+  return $ [Token (PostComment comment)]
 
 -- parse a single line of elements
 parseListElementsLine :: Parser [Token]
 parseListElementsLine = do
-  clusters <- parseComment <|> (sepEndBy (parsePostComment <|> parseElementCluster) spacesLine1)
-  return $ concat clusters
+  parseComment
+      <|> do
+          elements <- sepEndBy parseElementCluster spacesLine1
+          postComment <- option [] parsePostComment
+          return $ (concat elements) ++ postComment
 
 parseElementCluster :: Parser [Token]
 parseElementCluster = parsePrefixInfix <|> parseFirstItem
@@ -233,42 +246,43 @@ parseElementCluster = parsePrefixInfix <|> parseFirstItem
 parsePrefixInfix :: Parser [Token]
 parsePrefixInfix = do
   op <- parseOperatorString 
-  item <- option [] [parseItem]
+  item <- option [] parseItem
   case item of
     (_:[]) -> do
       more <- many parseInfixPostfix
-      return $ PrefixOperator op : (item ++ (concat more))
+      return $ (Token $ PrefixOperator op) : (item ++ (concat more))
     otherwise -> do 
-      return $ [InfixOperator op]
+      return $ [Token $ InfixOperator op]
 
 parseFirstItem :: Parser [Token]
 parseFirstItem = do
   item <- parseItem
   more <- many parseInfixPostfix
-  return $ [item] ++ (concat more)
+  return $ item ++ (concat more)
 
 parseInfixPostfix :: Parser [Token]
 parseInfixPostfix = do
   op <- parseOperatorString
-  item <- option [] [parseItem]
+  item <- option [] parseItem
   return $ case item of
-    (_:[]) -> InfixOperator op : item
-    otherwise -> [PostfixOperator op]
+    (_:[]) -> (Token $ InfixOperator op) : item
+    otherwise -> [Token $ PostfixOperator op]
 
-parseItem :: Parser Token
-parseItem = parseComment
-      <|> parseQuoted 
-      <|> parseDoubleQuoted 
-      <|> parseNumber
-      <|> parseSymbol
-      <|> parseList
-      <|> parseSquareBracketList
-      <|> parseCurlyBraceList
+parseItem :: Parser [Token]
+parseItem = do
+  item <- (parseQuoted 
+        <|> parseDoubleQuoted 
+        <|> parseNumber
+        <|> parseSymbol
+        <|> parseList
+        <|> parseSquareBracketList
+        <|> parseCurlyBraceList)
+  return item
 
-parseNestedLiterateComment :: Parser Token
+parseNestedLiterateComment :: Parser [Token]
 parseNestedLiterateComment = do
     lines <- many1 parseLiterateCommentLine
-    return $ Comment (concat lines)
+    return [Token $ Comment (concat lines)]
   <?> "Literate comment"
 
 parseNestedTokenLine :: Parser [Token]
@@ -277,34 +291,34 @@ parseNestedTokenLine = do
   elements <- parseListElementsLine
   return elements
 
-parseList :: Parser Token
+parseList :: Parser [Token]
 parseList = do
   begin <- char '('
-  elements <- many ([parseNestedLiterateComment]
+  elements <- many (parseNestedLiterateComment
                 <|> parseNestedTokenLine)
   end <- char ')'
-  return $ List $ (concat elements)
+  return $ concat elements
 
-parseSquareBracketList :: Parser Token
+parseSquareBracketList :: Parser [Token]
 parseSquareBracketList = do
   begin <- char '['
-  elements <- many ([parseNestedLiterateComment]
+  elements <- many (parseNestedLiterateComment
                 <|> parseNestedTokenLine)
   end <- char ']'
-  return $ SquareBracketList $ (concat elements)
+  return $ concat elements
 
-parseCurlyBraceList :: Parser Token
+parseCurlyBraceList :: Parser [Token]
 parseCurlyBraceList = do
   begin <- char '{'
-  elements <- many ([parseNestedLiterateComment]
+  elements <- many (parseNestedLiterateComment
                 <|> parseNestedTokenLine)
   end <- char '}'
-  return $ CurlyBraceList $ (concat elements)
+  return $ concat elements
 
 -- Tokenizer Functions
 --
 satisfyToken :: (Token -> Maybe a) -> Parser a
-satisfyToken test
+satisfyToken test 
   = token showToken posToken testToken
   where
     showToken (pos,tok)   = show tok
@@ -336,12 +350,12 @@ parseIndentedList = do
 
 -- Numeric literals
 
-parseNumber :: Parser Token
+parseNumber :: Parser [Token]
 parseNumber = do 
         -- parse a 0 then the number
         char '0'
         num <- zeroNumFloat
-        return num
+        return [num]
     -- or parse a decimal/float
     <|> decimalFloat ""
   <?> "Number"
@@ -357,7 +371,7 @@ zeroNumFloat =  do
   -- or parse a fract/float, e.g. .2e10
   <|> fractFloat "0"
   -- if all that fails this must be "just" a 0
-  <|> return (Integer "0")
+  <|> return [Token $ Integer "0"]
   
 decimalFloat :: String -> Parser Token
 decimalFloat zero = do 
@@ -365,7 +379,7 @@ decimalFloat zero = do
   num <- decimal
   let znum = zero ++ num
   -- see if there's a trailing fractional component
-  option (Integer num) (fractFloat znum)
+  option (Token $ Integer num) (fractFloat znum)
 
 fractFloat :: String -> Parser Token
 fractFloat num = do 
@@ -373,11 +387,11 @@ fractFloat num = do
     char '.'
     fract <- many1 digit
     exp <- option "" exponent'
-    return $ Float $ num ++ "." ++ fract ++ exp
+    return $ Token $ Float $ num ++ "." ++ fract ++ exp
   <|>
   -- just parse the exponent part (e.g. 0e-10)
   do exp <- exponent'
-     return $ Float (num ++ exp)
+     return $ Token $ Float (num ++ exp)
 
 exponent' :: Parser String
 exponent' = do
@@ -397,21 +411,21 @@ hexadecimal :: Parser Token
 hexadecimal = do
     x <- oneOf "xX"
     hex <- many1 hexDigit
-    return $ Hexadecimal ('0' : x : hex)
+    return $ Token $ Hexadecimal ('0' : x : hex)
   <?> "Hexadecimal Integer"
 
 octal :: Parser Token
 octal = do 
     o <- oneOf "oO"
     oct <- many1 octDigit
-    return $ Octal ('0' : o : oct)
+    return $ Token $ Octal ('0' : o : oct)
   <?> "Octal Integer"
 
 binary :: Parser Token
 binary = do 
     b <- oneOf "bB"
     bin <- many1 binaryDigit
-    return $ Binary ('0' : b : bin)
+    return $ Token $ Binary ('0' : b : bin)
   <?> "Binary Integer"
 
 -- parse a binary digit
